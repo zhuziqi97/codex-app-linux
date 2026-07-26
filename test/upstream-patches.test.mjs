@@ -9,6 +9,7 @@ import {
   hasUnguardedOwlFeatureBindingSource,
   patchDisableTransparencySource,
   patchLinuxOwlFeatureBindingSource,
+  patchLinuxChromeExtensionDetectionSource,
   patchLinuxWindowFocusableSource,
   patchLinuxOpenTargetsSource,
   upstreamPatchContracts
@@ -17,6 +18,68 @@ import {
 const openTargetResolverSource =
   "function W(e){let t=which.default.sync(e,{nothrow:!0});return typeof t==`string`&&fs.existsSync(t)?t:null}";
 const withOpenTargetResolver = parts => [openTargetResolverSource, ...parts].join(";");
+
+test("patchLinuxChromeExtensionDetectionSource finds stable Chrome profiles", () => {
+  const source =
+    "function o({homeDir:e,localAppDataDir:t,platform:n}){return n===`darwin`?p.join(e,`Library`,`Application Support`,`Google`,`Chrome`):n===`win32`?p.join(t??p.join(e,`AppData`,`Local`),`Google`,`Chrome`,`User Data`):null};globalThis.resolveChromeRoot=o";
+  const patched = patchLinuxChromeExtensionDetectionSource(source);
+  const context = {
+    globalThis: {},
+    p: { join: (...parts) => parts.join("/") }
+  };
+
+  vm.runInNewContext(patched, context);
+
+  assert.equal(
+    context.globalThis.resolveChromeRoot({
+      homeDir: "/home/zero",
+      platform: "linux"
+    }),
+    "/home/zero/.config/google-chrome"
+  );
+  assert.equal(
+    context.globalThis.resolveChromeRoot({
+      homeDir: "/Users/zero",
+      platform: "darwin"
+    }),
+    "/Users/zero/Library/Application Support/Google/Chrome"
+  );
+  assert.equal(patchLinuxChromeExtensionDetectionSource(patched), patched);
+});
+
+test("patchLinuxChromeExtensionDetectionSource accepts upstream native Linux profiles", () => {
+  const source =
+    "function Nu({platform:e,homeDirectory:t,localAppData:n}){return e===`darwin`?[p.join(t,`Library`,`Application Support`,`Google`,`Chrome`)]:e===`win32`?n==null?[]:[p.join(n,`Google`,`Chrome`,`User Data`)]:e===`linux`?[p.join(t,`.config`,`google-chrome`),p.join(t,`.config`,`google-chrome-beta`),p.join(t,`.config`,`google-chrome-canary`),p.join(t,`.config`,`chromium`)]:[]}globalThis.resolveChromeRoots=Nu";
+  const patched = patchLinuxChromeExtensionDetectionSource(source);
+  const context = {
+    globalThis: {},
+    p: { join: (...parts) => parts.join("/") }
+  };
+
+  vm.runInNewContext(patched, context);
+
+  assert.equal(patched, source);
+  assert.deepEqual(
+    Array.from(context.globalThis.resolveChromeRoots({
+      homeDirectory: "/home/zero",
+      platform: "linux"
+    })),
+    [
+      "/home/zero/.config/google-chrome",
+      "/home/zero/.config/google-chrome-beta",
+      "/home/zero/.config/google-chrome-canary",
+      "/home/zero/.config/chromium"
+    ]
+  );
+});
+
+test("patchLinuxChromeExtensionDetectionSource accepts metadata-driven Linux profiles", () => {
+  const source =
+    "function Ts({extensionId:e,chromeConfigHome:t=process.env.CHROME_CONFIG_HOME,homeDir:n=h.homedir(),localAppDataDir:r=process.env.LOCALAPPDATA,platform:i=process.platform,xdgConfigHome:a=process.env.XDG_CONFIG_HOME}){let o=js(e);return Ns({homeDir:n,chromeConfigHome:t,localAppDataDir:r,platform:i,xdgConfigHome:a}).some(e=>Ms(e,o))}" +
+    "function Ns({chromeConfigHome:e,homeDir:t,localAppDataDir:r,platform:i,xdgConfigHome:a}){if(i===`darwin`)return[p.join(t,...xs.macos.userDataDirectorySegments)];if(i===`win32`)return[p.join(r??p.join(t,`AppData`,`Local`),...xs.windows.userDataDirectorySegments)];if(i===`linux`){let r=n.On({chromeConfigHome:e,homeDir:t,xdgConfigHome:a});return n.Dn.map(e=>p.join(r,e.userDataDirName))}return[]}";
+
+  assert.equal(patchLinuxChromeExtensionDetectionSource(source), source);
+});
 
 test("patchLinuxOpenTargetsSource adds Linux editor targets and exposes app paths", () => {
   const source = withOpenTargetResolver([
@@ -172,7 +235,9 @@ test("upstream patch contracts declare required contract surface", () => {
       "open-target-dispatcher",
       "linux-window-background",
       "linux-window-transparency",
-      "linux-window-focusable-default"
+      "linux-window-focusable-default",
+      "linux-chrome-extension-host-content-variant",
+      "linux-chrome-extension-detection"
     ]
   );
 });

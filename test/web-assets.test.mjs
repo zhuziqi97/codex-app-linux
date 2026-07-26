@@ -116,9 +116,20 @@ test("createAppHostModuleBody resolves RPC peer constructor semantically", () =>
   );
 
   assert.match(body, /const rpcModulePromise = import/);
+  assert.match(body, /const functionToString = Function\.prototype\.toString;\s+const rpcModulePromise = import/);
   assert.match(body, /\[rpcModule\.tC, rpcModule\.V, rpcModule\.E, \.\.\.Object\.values\(rpcModule\)\]\.find/);
-  assert.match(body, /getRemoteMain/);
+  assert.match(body, /functionToString\.call\(value\)\.includes\("getRemoteMain"\)/);
+  assert.doesNotMatch(body, /Function\.prototype\.toString\.call\(value\)/);
   assert.doesNotMatch(body, /import \{ E as createRpcPeer \}/);
+});
+
+test("createAppHostModuleBody exposes Sparkle query params RPC", () => {
+  const body = createAppHostModuleBody(
+    "/tmp/codex-web/webview/assets/rpc-new.js",
+    "/tmp/codex-web/webview"
+  );
+
+  assert.match(body, /appUpdates:\s*\{[\s\S]*?setSparkleQueryParams\(\)\s*\{\s*\}/);
 });
 
 test("findAppHostRpcModulePath accepts upstream rpc facade layout", async () => {

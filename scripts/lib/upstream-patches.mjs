@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { parse } from "acorn";
 
+import { linuxChromeExtensionHostContentVariantContract } from "./chrome-extension-patches.mjs";
+
 const linuxOpenTargetDefinitions = ({ openCommandName, executableResolverName }) => [
   "var __codexLinuxOpenTargetGotoArgs=(e,t)=>t?[`--goto`,`${e}:${t.line}:${t.column}`]:[e]",
   "__codexLinuxOpenTargetColonArgs=(e,t)=>t?[`${e}:${t.line}:${t.column}`]:[e]",
@@ -27,6 +29,8 @@ const owlFeatureBindingRegex =
 const owlNullableFeatureBindingRegex =
   /function ([A-Za-z_$][\w$]*)\(\)\{let ([A-Za-z_$][\w$]*)=process\._linkedBinding;if\(typeof \2!=`function`\)return null;let ([A-Za-z_$][\w$]*);try\{\3=\2\.call\(process,([A-Za-z_$][\w$]*)\)\}catch\(([A-Za-z_$][\w$]*)\)\{if\(([A-Za-z_$][\w$]*)\(\5\)\)return null;throw \5\}return ([A-Za-z_$][\w$]*)\.parse\(\3\)\}/;
 const owlFeatureFallbackMarker = "__codexLinuxOwlFeatureFallback";
+const chromeProfileRootResolverRegex =
+  /function ([A-Za-z_$][\w$]*)\(\{homeDir:([A-Za-z_$][\w$]*),localAppDataDir:([A-Za-z_$][\w$]*),platform:([A-Za-z_$][\w$]*)\}\)\{return \4===`darwin`\?(\(0,[A-Za-z_$][\w$]*\.join\)|[A-Za-z_$][\w$]*\.join)\(\2,`Library`,`Application Support`,`Google`,`Chrome`\):\4===`win32`\?\5\(\3\?\?\5\(\2,`AppData`,`Local`\),`Google`,`Chrome`,`User Data`\):/g;
 
 export class UpstreamPatchContractError extends Error {
   constructor(contractName, message, options = {}) {
@@ -38,6 +42,13 @@ export class UpstreamPatchContractError extends Error {
   }
 }
 
+export const linuxChromeExtensionDetectionContract = {
+  name: "linux-chrome-extension-detection",
+  find: findLinuxChromeExtensionDetectionPatch,
+  assertBefore: assertLinuxChromeExtensionDetectionBefore,
+  apply: patchLinuxChromeExtensionDetection,
+  assertAfter: assertLinuxChromeExtensionDetectionAfter
+};
 export const upstreamPatchContracts = [
   // Why: upstream desktop only registers macOS open-in-editor targets; Linux
   // needs locally installed editors and terminal-backed Neovim. Contract:
@@ -81,7 +92,17 @@ export const upstreamPatchContracts = [
     assertBefore: assertLinuxWindowFocusableBefore,
     apply: patchLinuxWindowFocusable,
     assertAfter: assertLinuxWindowFocusableAfter
-  }
+  },
+  // Why: older launcher builds cached the same upstream Chrome plugin version
+  // without a Linux native host. Upstream rewrites bundledContentVariant while
+  // materializing the cache, so the Linux host revision must be composed there.
+  linuxChromeExtensionHostContentVariantContract,
+  // Why: upstream only searches Chrome profiles on macOS and Windows, which
+  // makes the official extension look absent on Linux. Without detection, the
+  // desktop never installs the Chrome plugin or writes its native manifest.
+  // Contract: the main bundle still resolves the Google Chrome profile root
+  // from homeDir, localAppDataDir, and platform.
+  linuxChromeExtensionDetectionContract
 ];
 
 export const owlFeatureBindingContract = {
@@ -120,6 +141,10 @@ export function patchUpstreamMainSource(source) {
 
 export function patchLinuxOpenTargetsSource(source) {
   return applyUpstreamPatchContract(source, upstreamPatchContracts[0]);
+}
+
+export function patchLinuxChromeExtensionDetectionSource(source) {
+  return applyUpstreamPatchContract(source, linuxChromeExtensionDetectionContract);
 }
 
 export function patchDisableTransparencySource(source) {
@@ -755,6 +780,124 @@ function isTrueExpression(node) {
     node.argument.type === "Literal" &&
     (node.argument.value === 0 || node.argument.value === false)
   );
+}
+
+function findLinuxChromeExtensionDetectionPatch(source) {
+  if (hasNativeLinuxChromeExtensionDetection(source)) {
+    return { status: "patched" };
+  }
+
+  const matches = [...source.matchAll(chromeProfileRootResolverRegex)];
+
+  if (matches.length !== 1) {
+    throw new Error(`expected one Chrome profile root resolver, found ${matches.length}`);
+  }
+
+  const match = matches[0];
+  const homeDir = match[2];
+  const platform = match[4];
+  const join = match[5];
+  const start = match.index + match[0].length;
+  const linuxRoot = `${platform}===\`linux\`?${join}(${homeDir},\`.config\`,\`google-chrome\`):null`;
+
+  if (source.startsWith(`${linuxRoot}}`, start)) {
+    return { status: "patched" };
+  }
+
+  if (!source.startsWith("null}", start)) {
+    throw new Error("Chrome profile root resolver has an unknown fallback");
+  }
+
+  return {
+    status: "patch",
+    start,
+    end: start + "null".length,
+    replacement: linuxRoot
+  };
+}
+
+function hasNativeLinuxChromeExtensionDetection(source) {
+  const ast = parseJavaScript(source);
+  let foundNativeResolver = false;
+
+  walkAst(ast, node => {
+    if (!isFunctionNode(node) || node.params.length !== 1) {
+      return;
+    }
+
+    const bindings = objectPatternBindings(node.params[0]);
+    const platform = bindings.platform;
+    const homeDirectory = bindings.homeDirectory ?? bindings.homeDir;
+    const localAppData = bindings.localAppData ?? bindings.localAppDataDir;
+
+    if (!platform || !homeDirectory || !localAppData) {
+      return;
+    }
+
+    const commonLiterals = new Set(["darwin", "win32", "linux"]);
+    const directProfileLiterals = new Set([
+      "Library", "Application Support", "Google", "Chrome", "User Data", ".config", "google-chrome"
+    ]);
+    const metadataProfileLiterals = new Set(["AppData", "Local"]);
+    let hasUserDataDirectorySegments = false;
+    let hasUserDataDirName = false;
+
+    // The metadata resolver reads `userDataDirName` inside a `.map()` callback,
+    // so inspect its nested arrow body as part of the resolver contract.
+    walkAst(node, child => {
+      for (const literal of commonLiterals) {
+        if (isStringLiteral(child, literal)) {
+          commonLiterals.delete(literal);
+        }
+      }
+      for (const literal of directProfileLiterals) {
+        if (isStringLiteral(child, literal)) {
+          directProfileLiterals.delete(literal);
+        }
+      }
+      for (const literal of metadataProfileLiterals) {
+        if (isStringLiteral(child, literal)) {
+          metadataProfileLiterals.delete(literal);
+        }
+      }
+      hasUserDataDirectorySegments ||= isMemberPropertyNamed(child, "userDataDirectorySegments");
+      hasUserDataDirName ||= isMemberPropertyNamed(child, "userDataDirName");
+    });
+
+    const hasDirectProfiles = directProfileLiterals.size === 0;
+    const hasMetadataProfiles =
+      bindings.chromeConfigHome &&
+      bindings.xdgConfigHome &&
+      metadataProfileLiterals.size === 0 &&
+      hasUserDataDirectorySegments &&
+      hasUserDataDirName;
+
+    foundNativeResolver ||= commonLiterals.size === 0 && (hasDirectProfiles || hasMetadataProfiles);
+  });
+
+  return foundNativeResolver;
+}
+
+function patchLinuxChromeExtensionDetection(source) {
+  const patch = findLinuxChromeExtensionDetectionPatch(source);
+
+  if (patch.status === "patched") {
+    return source;
+  }
+
+  return source.slice(0, patch.start) + patch.replacement + source.slice(patch.end);
+}
+
+function assertLinuxChromeExtensionDetectionBefore(source) {
+  if (findLinuxChromeExtensionDetectionPatch(source).status !== "patch") {
+    throw new Error("Linux Chrome profile root is not patchable");
+  }
+}
+
+function assertLinuxChromeExtensionDetectionAfter(source) {
+  if (findLinuxChromeExtensionDetectionPatch(source).status !== "patched") {
+    throw new Error("Linux Chrome profile root assertion failed");
+  }
 }
 
 function parseJavaScript(source) {

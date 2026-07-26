@@ -1,11 +1,67 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import {
   evaluateBundledCodexLauncherSource,
   evaluateDesktopBootResult,
-  evaluateLinuxWindowFocusableContractSources
+  evaluateLinuxWindowFocusableContractSources,
+  formatBrowserSmokeFailure,
+  runCommandForTest,
+  smokeBundledCodexDynamicTools
 } from "../scripts/smoke-artifacts.mjs";
+import {
+  evaluateLinuxChromeExtensionHostArtifact,
+  evaluateLinuxChromeExtensionHostEnsure,
+  evaluateLinuxChromeExtensionHostHello,
+  parseNativeMessageFrame
+} from "../scripts/lib/chrome-extension-smoke.mjs";
+
+test("browser smoke failures preserve console and rendered-page diagnostics", () => {
+  const message = formatBrowserSmokeFailure({
+    error: new Error("page.waitForFunction: Timeout 45000ms exceeded"),
+    fatalConsole: ["TypeError: missing app host RPC"],
+    bodyText: "  Loading ChatGPT\n\nUpdate required  ",
+    url: "http://127.0.0.1:3000/"
+  });
+
+  assert.match(message, /browser smoke failed for http:\/\/127\.0\.0\.1:3000\//);
+  assert.match(message, /page\.waitForFunction: Timeout 45000ms exceeded/);
+  assert.match(message, /TypeError: missing app host RPC/);
+  assert.match(message, /body: Loading ChatGPT Update required/);
+});
+
+test("bundled Codex dynamic-tool smoke runs its app-server protocol", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-app-linux-smoke-test-"));
+  const resourcesDir = path.join(root, "resources");
+  const executablePath = path.join(resourcesDir, "codex");
+
+  try {
+    await fs.mkdir(resourcesDir);
+    await fs.writeFile(executablePath, `#!/usr/bin/env node
+const readline = require("node:readline");
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", line => {
+  const message = JSON.parse(line);
+  if (message.id === 1) console.log(JSON.stringify({ id: 1, result: {} }));
+  if (message.id === 2) console.log(JSON.stringify({ id: 2, result: { thread: { id: "canonical" } } }));
+  if (message.id === 3) console.log(JSON.stringify({ id: 3, result: { thread: { id: "legacy" } } }));
+  if (message.id === 4) console.log(JSON.stringify({ id: 4, error: { message: "dynamic tools must use either canonical or legacy format consistently" } }));
+});
+`);
+    await fs.chmod(executablePath, 0o755);
+
+    assert.deepEqual(await smokeBundledCodexDynamicTools(resourcesDir), {
+      canonicalThreadId: "canonical",
+      legacyThreadId: "legacy",
+      hybridRejected: true
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("desktop boot smoke accepts a silent process still alive at timeout", () => {
   assert.deepEqual(
@@ -59,6 +115,26 @@ test("desktop boot smoke rejects native failed-start dialogs", () => {
     }),
     /desktop binary showed startup failure dialog/
   );
+});
+
+test("timed-out smoke commands terminate descendants holding stdio open", {
+  skip: process.platform === "win32"
+}, async () => {
+  const startedAt = Date.now();
+  const result = await runCommandForTest(
+    process.execPath,
+    [
+      "-e",
+      `require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], {
+        stdio: ["ignore", "inherit", "inherit"]
+      });
+      setInterval(() => {}, 60000);`
+    ],
+    { allowTimeout: true, capture: true, timeoutMs: 100 }
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.ok(Date.now() - startedAt < 2000);
 });
 
 test("bundled Codex launcher smoke rejects PATH-first wrappers", () => {
@@ -128,5 +204,133 @@ test("Linux window focusable smoke accepts patched and legacy-safe defaults", ()
       checked: 2,
       unsafe: []
     }
+  );
+});
+
+test("Chrome extension host smoke accepts an executable static PIE x64 host", () => {
+  assert.deepEqual(
+    evaluateLinuxChromeExtensionHostArtifact({
+      fileType:
+        "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, stripped",
+      mode: 0o755
+    }),
+    {
+      executable: true,
+      static: true,
+      architecture: "x86-64"
+    }
+  );
+});
+
+test("Chrome extension host smoke rejects dynamic and non-executable hosts", () => {
+  assert.throws(
+    () =>
+      evaluateLinuxChromeExtensionHostArtifact({
+        fileType:
+          "ELF 64-bit LSB pie executable, x86-64, dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2",
+        mode: 0o755
+      }),
+    /must be statically linked/
+  );
+  assert.throws(
+    () =>
+      evaluateLinuxChromeExtensionHostArtifact({
+        fileType:
+          "ELF 64-bit LSB pie executable, x86-64, static-pie linked, stripped",
+        mode: 0o644
+      }),
+    /must be executable/
+  );
+});
+
+test("Chrome extension host smoke decodes and verifies the protocol-v2 hello", () => {
+  const message = {
+    jsonrpc: "2.0",
+    id: "smoke-hello",
+    result: {
+      manifestSchemaVersion: 2,
+      nativeHostProtocolVersion: 2,
+      nativeHostVersion: "0.1.0",
+      supportedProtocolVersions: [2],
+      supportedMethods: ["codexRuntime/openLocalFile"]
+    }
+  };
+  const body = Buffer.from(JSON.stringify(message));
+  const frame = Buffer.alloc(4 + body.length);
+  frame.writeUInt32LE(body.length);
+  body.copy(frame, 4);
+
+  assert.deepEqual(parseNativeMessageFrame(frame), message);
+  assert.deepEqual(evaluateLinuxChromeExtensionHostHello(message), {
+    protocolVersion: 2,
+    version: "0.1.0"
+  });
+  assert.throws(
+    () => evaluateLinuxChromeExtensionHostHello({ ...message, id: "wrong" }),
+    /unexpected hello response ID/
+  );
+  assert.throws(() => parseNativeMessageFrame(frame.subarray(0, -1)), /truncated/);
+});
+
+test("Chrome extension host smoke verifies desktop-managed runtime selection", () => {
+  const message = {
+    jsonrpc: "2.0",
+    id: "smoke-ensure",
+    result: {
+      entryId: "linux-managed-smoke",
+      localAppServerUrl: "ws://127.0.0.1:4567/?token=secret",
+      runtimeSessionId: "session",
+      selected: {
+        appServerProtocolVersion: 2,
+        channel: "prod",
+        nativeHostProtocolVersion: 2
+      },
+      runtimeConfig: {
+        platform: "linux",
+        codexCliPath: "/opt/codex/resources/codex",
+        codexHome: "/tmp/codex-home",
+        desktopAgentModeDefaults: {
+          agentModesByHostId: {},
+          preferredNonFullAccessModesByHostId: {}
+        },
+        nodePath: "/opt/codex/resources/node"
+      }
+    }
+  };
+
+  assert.deepEqual(
+    evaluateLinuxChromeExtensionHostEnsure(message, {
+      channelName: "prod",
+      codexCliPath: "/opt/codex/resources/codex",
+      codexHome: "/tmp/codex-home",
+      nodePath: "/opt/codex/resources/node"
+    }),
+    {
+      channel: "prod",
+      entryId: "linux-managed-smoke",
+      protocolVersion: 2
+    }
+  );
+  assert.throws(
+    () => evaluateLinuxChromeExtensionHostEnsure({ ...message, id: "wrong" }, {}),
+    /unexpected ensure response ID/
+  );
+  assert.throws(
+    () => evaluateLinuxChromeExtensionHostEnsure({
+      ...message,
+      result: {
+        ...message.result,
+        runtimeConfig: {
+          ...message.result.runtimeConfig,
+          desktopAgentModeDefaults: null
+        }
+      }
+    }, {
+      channelName: "prod",
+      codexCliPath: "/opt/codex/resources/codex",
+      codexHome: "/tmp/codex-home",
+      nodePath: "/opt/codex/resources/node"
+    }),
+    /incompatible managed runtime/
   );
 });

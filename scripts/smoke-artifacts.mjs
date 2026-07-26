@@ -7,6 +7,7 @@ import { spawn, spawnSync } from "node:child_process";
 import * as asar from "@electron/asar";
 
 import { channelPaths, getChannel, parseArgs, projectRoot } from "./lib/config.mjs";
+import { assertLinuxChromeExtensionHost } from "./lib/chrome-extension-smoke.mjs";
 import {
   hasLinuxWindowFocusableContractSource,
   hasUnguardedLinuxWindowFocusableSource,
@@ -55,6 +56,9 @@ export async function smokeLinuxArtifacts({
   await accessFile(executablePath, "desktop executable");
   await runCheck(summary, "linux-native-payloads", () =>
     assertNoForeignNativePayloads(linuxDir)
+  );
+  await runCheck(summary, "chrome-extension-host", () =>
+    assertLinuxChromeExtensionHost(resourcesDir, channelName || "prod")
   );
   await runCheck(summary, "node-runtime", () =>
     assertCommandSuccess(path.join(resourcesDir, "node"), ["--version"], {
@@ -267,7 +271,7 @@ export function evaluateBundledCodexLauncherSource(source) {
   }
 }
 
-async function smokeBundledCodexDynamicTools(resourcesDir) {
+export async function smokeBundledCodexDynamicTools(resourcesDir) {
   const executablePath = path.resolve(resourcesDir, "codex");
   await accessFile(executablePath, "bundled Codex CLI");
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "codex-app-linux-dynamic-tools-"));
@@ -729,16 +733,47 @@ async function smokeBrowserPage(url) {
       const splashOnly = body?.children.length <= 2 && document.querySelector("svg") && text.trim().length < 20;
 
       return Boolean(interactive) || (text.trim().length > 20 && !splashOnly);
-    }, {
+    }, undefined, {
       timeout: 45_000
     });
 
     if (fatalConsole.length > 0) {
       throw new Error(`fatal browser console output: ${fatalConsole.slice(0, 5).join("\n")}`);
     }
+  } catch (error) {
+    let bodyText = "";
+
+    try {
+      bodyText = await page.locator("body").innerText({ timeout: 1000 });
+    } catch {
+      // The page may have crashed or closed. Console output and the original
+      // Playwright error still provide the primary failure evidence.
+    }
+
+    throw new Error(formatBrowserSmokeFailure({
+      error,
+      fatalConsole,
+      bodyText,
+      url
+    }), { cause: error });
   } finally {
     await browser.close();
   }
+}
+
+export function formatBrowserSmokeFailure({ error, fatalConsole = [], bodyText = "", url }) {
+  const details = [`browser smoke failed for ${url}: ${toErrorMessage(error)}`];
+
+  if (fatalConsole.length > 0) {
+    details.push(`console: ${fatalConsole.slice(0, 5).join(" | ")}`);
+  }
+
+  const renderedBody = String(bodyText).replace(/\s+/g, " ").trim().slice(0, 1000);
+  if (renderedBody) {
+    details.push(`body: ${renderedBody}`);
+  }
+
+  return details.join("\n");
 }
 
 async function assertCommandSuccess(command, args, options = {}) {
@@ -847,6 +882,7 @@ function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: projectRoot,
+      detached: process.platform !== "win32",
       env,
       stdio: capture ? ["pipe", "pipe", "pipe"] : "inherit"
     });
@@ -854,10 +890,13 @@ function runCommand(command, args, options = {}) {
     let stderr = "";
     let timedOut = false;
     let timeoutMetadata = {};
+    let forceKillTimer;
     const timer = setTimeout(() => {
       timedOut = true;
       timeoutMetadata = onTimeout?.() || {};
-      child.kill("SIGTERM");
+      signalProcessTree(child, "SIGTERM");
+      forceKillTimer = setTimeout(() => signalProcessTree(child, "SIGKILL"), 2000);
+      forceKillTimer.unref();
     }, timeoutMs);
 
     child.stdout?.on("data", chunk => {
@@ -868,10 +907,16 @@ function runCommand(command, args, options = {}) {
     });
     child.on("error", error => {
       clearTimeout(timer);
+      clearTimeout(forceKillTimer);
       reject(error);
     });
     child.on("exit", code => {
       clearTimeout(timer);
+      clearTimeout(forceKillTimer);
+      if (timedOut) signalProcessTree(child, "SIGKILL");
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
 
       if (timedOut && !allowTimeout) {
         reject(new Error(`${command} timed out after ${timeoutMs}ms`));
@@ -891,6 +936,24 @@ function runCommand(command, args, options = {}) {
       child.stdin?.end(input);
     }
   });
+}
+
+export function runCommandForTest(command, args, options) {
+  return runCommand(command, args, options);
+}
+
+function signalProcessTree(child, signal) {
+  if (child.pid == null) return false;
+  try {
+    if (process.platform !== "win32") {
+      process.kill(-child.pid, signal);
+      return true;
+    }
+    return child.kill(signal);
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
 }
 
 function readX11WindowTree() {
